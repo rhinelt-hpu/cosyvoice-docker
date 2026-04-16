@@ -12,9 +12,10 @@ services:
     environment:
       - MODEL_DIR=${MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B}
       - PORT=8188
+      - NUM_GPUS=${NUM_GPUS:-1}
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-4}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}
       - GPU_IDLE_TIMEOUT=${GPU_IDLE_TIMEOUT:-600}
-      - NVIDIA_VISIBLE_DEVICES=1
-      - CUDA_VISIBLE_DEVICES=0
     deploy:
       resources:
         reservations:

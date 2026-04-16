@@ -54,6 +54,11 @@ RUN pip install --no-cache-dir huggingface_hub && \
 # Create data directories
 RUN mkdir -p /data/input /data/output
 
+# Install vLLM for LLM acceleration
+RUN pip install --no-cache-dir vllm==0.9.0 \
+    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
+
+
 # Environment variables
 ENV MODEL_DIR=pretrained_models/${MODEL_NAME}
 ENV INPUT_DIR=/data/input

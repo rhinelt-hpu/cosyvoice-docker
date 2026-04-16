@@ -28,6 +28,11 @@ sys.path.insert(0, str(ROOT_DIR / "third_party/Matcha-TTS"))
 from cosyvoice.cli.cosyvoice import AutoModel
 from cosyvoice.utils.file_utils import load_wav
 
+# Register vLLM custom model for CosyVoice
+from vllm import ModelRegistry
+from cosyvoice.vllm.cosyvoice2 import CosyVoice2ForCausalLM
+ModelRegistry.register_model("CosyVoice2ForCausalLM", CosyVoice2ForCausalLM)
+
 # Fun-ASR-Nano for auto transcription
 _asr_model = None
 
@@ -118,99 +123,160 @@ class VoiceManager:
 
 voice_manager = VoiceManager(VOICES_DIR)
 
-# GPU Manager - 禁用自动卸载，启动时预热
+# GPU Manager - 多卡实例池 + 并发控制 + 信号量
 class GPUManager:
     def __init__(self):
-        self.model = None
+        self.num_gpus = int(os.getenv("NUM_GPUS", "1"))
+        self.max_concurrent = int(os.getenv("MAX_CONCURRENT", "4"))
         self.model_dir = None
+        self.models = []  # 模型实例池
+        self.model_gpus = []  # 每个实例对应的 GPU ID
+        self.request_counter = 0  # round-robin 计数器
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
         self.lock = threading.Lock()
-        self.prompt_cache = {}  # 缓存 prompt 特征
-        
-    def get_model(self, model_dir: str = None):
-        with self.lock:
-            if model_dir is None:
-                model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
-            if self.model is None or self.model_dir != model_dir:
-                self._load_model(model_dir)
-            return self.model
-    
-    def _load_model(self, model_dir: str):
-        if self.model is not None:
-            self.offload()
-        print(f"Loading model from {model_dir} with FP16 acceleration...")
-        self.model = AutoModel(model_dir=model_dir, fp16=True)
-        self.model_dir = model_dir
-        print(f"Model loaded successfully (FP16)!")
-    
-    def preload(self):
-        """启动时预热模型和所有音色的 embedding"""
-        print("Preloading model...")
-        model = self.get_model()
-        print("Model preloaded!")
-        
-        # 预热所有已保存音色的 embedding
-        voices = voice_manager.list_all()
-        if voices:
-            print(f"Preloading {len(voices)} voice embeddings...")
-            for v in voices:
-                voice = voice_manager.get(v["id"])
-                if voice and os.path.exists(voice["audio_path"]):
-                    try:
-                        # 调用一次 frontend_zero_shot 触发缓存
-                        model.frontend.frontend_zero_shot(
-                            "预热", voice["text"], voice["audio_path"], 
-                            24000, ""
-                        )
-                        print(f"  ✓ Cached: {v['name']} ({v['id']})")
-                    except Exception as e:
-                        print(f"  ✗ Failed: {v['name']} - {e}")
-            print(f"Voice embeddings cached: {len(model.frontend.prompt_cache)}")
-        
-        print("Model preloaded and ready!")
-    
-    def offload(self):
-        """手动卸载模型"""
-        if self.model:
-            del self.model
-            self.model = None
-            self.model_dir = None
-            self.prompt_cache.clear()
-            gc.collect()
+        self.prompt_caches = {}  # per-model prompt cache
+
+    def _load_model_on_gpu(self, gpu_id: int, model_dir: str):
+        """在指定 GPU 上加载模型"""
+        prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        try:
+            # 清除之前的 CUDA 缓存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            print("GPU memory released")
-    
-    def get_prompt_cache(self, voice_id: str):
-        """获取缓存的 prompt 特征"""
-        return self.prompt_cache.get(voice_id)
-    
-    def set_prompt_cache(self, voice_id: str, cache_data: dict):
-        """缓存 prompt 特征"""
-        self.prompt_cache[voice_id] = cache_data
-    
+
+            print(f"Loading model on GPU {gpu_id} from {model_dir} with FP16 + vLLM acceleration...")
+            model = AutoModel(model_dir=model_dir, fp16=True, load_vllm=True, load_trt=False)
+            self.model_dir = model_dir
+            self.models.append(model)
+            self.model_gpus.append(gpu_id)
+            self.prompt_caches[gpu_id] = {}
+            print(f"Model loaded successfully on GPU {gpu_id} (FP16 + vLLM)!")
+        finally:
+            if prev_cuda is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
+            else:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    def _select_gpu(self) -> int:
+        """Round-robin 选择 GPU 索引"""
+        idx = self.request_counter % len(self.models)
+        self.request_counter += 1
+        return self.model_gpus[idx]
+
+    def init_models(self, model_dir: str = None):
+        """同步初始化：加载所有 GPU 上的模型"""
+        if model_dir is None:
+            model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
+        for i in range(self.num_gpus):
+            self._load_model_on_gpu(i, model_dir)
+
+    def preload(self):
+        """启动时预热模型和所有音色的 embedding"""
+        print("Preloading models...")
+        for gpu_id, model in zip(self.model_gpus, self.models):
+            print(f"Preloading model on GPU {gpu_id}...")
+
+            # 预热所有已保存音色的 embedding
+            voices = voice_manager.list_all()
+            if voices:
+                print(f"  Preloading {len(voices)} voice embeddings...")
+                for v in voices:
+                    voice = voice_manager.get(v["id"])
+                    if voice and os.path.exists(voice["audio_path"]):
+                        try:
+                            model.frontend.frontend_zero_shot(
+                                "预热", voice["text"], voice["audio_path"],
+                                24000, ""
+                            )
+                            print(f"    ✓ Cached: {v['name']} ({v['id']})")
+                        except Exception as e:
+                            print(f"    ✗ Failed: {v['name']} - {e}")
+                print(f"  Voice embeddings cached: {len(model.frontend.prompt_cache)}")
+
+        print("All models preloaded and ready!")
+
+    def get_model(self, model_dir: str = None):
+        """获取默认模型（兼容性接口，返回第一个 GPU 上的模型）"""
+        if self.models:
+            return self.models[0]
+        return None
+
+    def get_model_for_request(self) -> tuple:
+        """为请求选择模型，返回 (model, gpu_id)"""
+        with self.lock:
+            gpu_id = self._select_gpu()
+        idx = self.model_gpus.index(gpu_id)
+        return self.models[idx], gpu_id
+
+    async def run_inference(self, func, *args, **kwargs):
+        """并发安全的推理入口（非流式）"""
+        async with self.semaphore:
+            model, gpu_id = self.get_model_for_request()
+            result = await asyncio.to_thread(func, model, gpu_id, *args, **kwargs)
+            return result
+
+    def run_inference_sync(self, func, *args, **kwargs):
+        """并发安全的推理入口（同步，用于流式 StreamingResponse）"""
+        model, gpu_id = self.get_model_for_request()
+        return func(model, gpu_id, *args, **kwargs)
+
+    def offload(self):
+        """手动卸载所有模型"""
+        for model in self.models:
+            if model:
+                del model
+        self.models.clear()
+        self.model_gpus.clear()
+        self.prompt_caches.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("GPU memory released")
+
     def status(self) -> dict:
         gpu_info = {"available": torch.cuda.is_available()}
         if torch.cuda.is_available():
+            gpu_devices = []
+            total_mem = 0.0
+            used_mem = 0.0
+            for gpu_id in self.model_gpus:
+                try:
+                    total_mem += torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
+                    used_mem += torch.cuda.memory_allocated(gpu_id) / 1024**3
+                    gpu_devices.append(torch.cuda.get_device_name(gpu_id))
+                except:
+                    pass
             gpu_info.update({
-                "device": torch.cuda.get_device_name(0),
-                "memory_used": f"{torch.cuda.memory_allocated()/1024**3:.2f} GB",
-                "memory_total": f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB",
+                "devices": gpu_devices,
+                "memory_used": f"{used_mem:.2f} GB",
+                "memory_total": f"{total_mem:.2f} GB",
+                "num_gpus": len(self.models),
             })
-        # 获取真实的 frontend 缓存数量
-        cache_size = len(self.model.frontend.prompt_cache) if self.model else 0
+        cache_size = sum(len(pc) for pc in self.prompt_caches.values())
         return {
-            "model_loaded": self.model is not None,
+            "model_loaded": len(self.models) > 0,
             "model_dir": self.model_dir,
             "gpu": gpu_info,
+            "max_concurrent": self.max_concurrent,
             "prompt_cache_size": cache_size
         }
+
+    def get_prompt_cache(self, gpu_id: int) -> dict:
+        """获取指定 GPU 的 prompt 特征缓存"""
+        return self.prompt_caches.get(gpu_id, {})
+
+    def set_prompt_cache(self, gpu_id: int, cache_data: dict):
+        """缓存 prompt 特征到指定 GPU"""
+        self.prompt_caches[gpu_id] = cache_data
 
 gpu_manager = GPUManager()
 
 # FastAPI App - 启动时预热模型
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时预热模型
+    # 初始化多卡模型池 + 预热
+    gpu_manager.init_models()
     gpu_manager.preload()
     yield
     # 关闭时不自动卸载（保持模型在显存中）
@@ -273,23 +339,23 @@ def generate_audio_stream(model_output, sample_rate: int, cleanup_path: str = No
     is_first_chunk = True
     dc_offset = 0.0
     alpha = 0.001  # DC offset sliding average coefficient
-    
+
     try:
         for chunk in model_output:
             wav_chunk = chunk['tts_speech'].numpy().flatten()
-            
+
             # Remove DC offset using sliding average
             chunk_mean = np.mean(wav_chunk)
             dc_offset = dc_offset * (1 - alpha) + chunk_mean * alpha
             wav_chunk = wav_chunk - dc_offset
-            
+
             # Apply fade-in to first chunk
             if is_first_chunk:
                 fade_len = min(2048, len(wav_chunk))
                 fade = np.linspace(0, 1, fade_len)
                 wav_chunk[:fade_len] *= fade
                 is_first_chunk = False
-            
+
             # Convert to int16 PCM
             audio = (wav_chunk * 32767).astype(np.int16).tobytes()
             yield audio
@@ -297,6 +363,14 @@ def generate_audio_stream(model_output, sample_rate: int, cleanup_path: str = No
         # Cleanup temp file after streaming completes
         if cleanup_path and Path(cleanup_path).exists():
             Path(cleanup_path).unlink()
+
+
+def generate_stream_with_semaphore(model_output, sample_rate: int, cleanup_path: str = None):
+    """Stream generator that releases semaphore when done"""
+    try:
+        yield from generate_audio_stream(model_output, sample_rate, cleanup_path)
+    finally:
+        gpu_manager.semaphore.release()
 
 # ============== OpenAI-Compatible API ==============
 
@@ -310,60 +384,61 @@ class SpeechRequest(BaseModel):
 
 @app.post("/v1/audio/speech")
 async def openai_speech(request: SpeechRequest):
-    """OpenAI-compatible TTS API"""
-    model = gpu_manager.get_model()
-    
-    # 检查是否是自定义音色
-    custom_voice = voice_manager.get(request.voice)
-    
-    if custom_voice:
-        # 使用自定义音色
-        prompt_audio = custom_voice["audio_path"]
-        # 添加 <|endofprompt|> 前缀修复音频重复问题 (GitHub Issue #967, #1704)
-        prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
-        
-        if request.instruct:
-            # instruct 模式
-            if hasattr(model, 'inference_instruct2'):
-                output = model.inference_instruct2(
-                    request.input, request.instruct, prompt_audio,
-                    stream=(request.response_format == "pcm"), speed=request.speed
-                )
+    """OpenAI-compatible TTS API (concurrency-controlled)"""
+
+    def _do_speech(model, gpu_id):
+        # 检查是否是自定义音色
+        custom_voice = voice_manager.get(request.voice)
+
+        if custom_voice:
+            prompt_audio = custom_voice["audio_path"]
+            prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
+
+            if request.instruct:
+                if hasattr(model, 'inference_instruct2'):
+                    output = model.inference_instruct2(
+                        request.input, request.instruct, prompt_audio,
+                        stream=(request.response_format == "pcm"), speed=request.speed
+                    )
+                else:
+                    output = model.inference_zero_shot(
+                        request.input, prompt_text, prompt_audio,
+                        stream=(request.response_format == "pcm"), speed=request.speed
+                    )
             else:
                 output = model.inference_zero_shot(
                     request.input, prompt_text, prompt_audio,
                     stream=(request.response_format == "pcm"), speed=request.speed
                 )
         else:
-            # zero_shot 模式
-            output = model.inference_zero_shot(
-                request.input, prompt_text, prompt_audio,
-                stream=(request.response_format == "pcm"), speed=request.speed
-            )
-    else:
-        # 使用预训练音色（如果有）
-        available_spks = model.list_available_spks()
-        if request.voice in available_spks:
-            output = model.inference_sft(
-                request.input, request.voice,
-                stream=(request.response_format == "pcm"), speed=request.speed
-            )
-        else:
-            raise HTTPException(400, f"Voice '{request.voice}' not found. Use /v1/voices to list available voices or create custom voice via /v1/voices/create")
-    
-    if request.response_format == "pcm":
+            available_spks = model.list_available_spks()
+            if request.voice in available_spks:
+                output = model.inference_sft(
+                    request.input, request.voice,
+                    stream=(request.response_format == "pcm"), speed=request.speed
+                )
+            else:
+                raise HTTPException(400, f"Voice '{request.voice}' not found")
+
+        if request.response_format == "pcm":
+            return output, model.sample_rate, True
+
+        speeches = [chunk['tts_speech'] for chunk in output]
+        full_speech = torch.cat(speeches, dim=1)
+        filename = f"speech_{uuid.uuid4().hex[:8]}.wav"
+        output_path = save_audio(full_speech, model.sample_rate, filename)
+        return output_path, model.sample_rate, False
+
+    result = await gpu_manager.run_inference(_do_speech)
+    output_path, sample_rate, is_stream = result
+
+    if is_stream:
         return StreamingResponse(
-            generate_audio_stream(output, model.sample_rate),
+            generate_audio_stream(output_path, sample_rate),
             media_type="audio/pcm",
-            headers={"X-Sample-Rate": str(model.sample_rate)}
+            headers={"X-Sample-Rate": str(sample_rate)}
         )
-    
-    # 收集所有 chunks 并返回 WAV
-    speeches = [chunk['tts_speech'] for chunk in output]
-    full_speech = torch.cat(speeches, dim=1)
-    filename = f"speech_{uuid.uuid4().hex[:8]}.wav"
-    output_path = save_audio(full_speech, model.sample_rate, filename)
-    return FileResponse(output_path, media_type="audio/wav", filename=filename)
+    return FileResponse(output_path, media_type="audio/wav", filename=output_path)
 
 @app.post("/v1/voices/create")
 async def create_voice(
@@ -468,87 +543,89 @@ async def tts(
     stream: bool = Form(False),
     prompt_wav: Optional[UploadFile] = File(None)
 ):
-    model = gpu_manager.get_model()
-    prompt_audio = None
-    is_temp_file = False  # 标记是否是临时文件，只有临时文件才需要清理
-    
-    # 优先使用自定义音色
-    custom_voice = voice_manager.get(voice) if voice else None
-    if custom_voice:
-        prompt_audio = custom_voice["audio_path"]
-        # 添加 <|endofprompt|> 前缀修复音频重复问题
-        prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
-    elif prompt_wav:
-        content = await prompt_wav.read()
-        temp_path = INPUT_DIR / f"prompt_{uuid.uuid4().hex}.wav"
-        temp_path.write_bytes(content)
-        prompt_audio = str(temp_path)
-        is_temp_file = True  # 上传的文件是临时文件
-    
+    # Acquire concurrency slot
+    await gpu_manager.semaphore.acquire()
     try:
-        # 参数验证
-        if mode == "zero_shot":
-            if not prompt_audio:
-                raise HTTPException(400, "zero_shot mode requires prompt_wav or voice (custom voice ID)")
-            # 自动识别 prompt_text (仅当未使用自定义音色且没有提供 prompt_text 时)
-            if not prompt_text and not custom_voice:
-                print("Auto transcribing prompt audio with Fun-ASR...")
-                prompt_text = transcribe_audio(prompt_audio)
-                # 添加前缀修复重复问题
-                prompt_text = f'<|endofprompt|>{prompt_text}'
-                print(f"Transcribed: {prompt_text}")
-        elif mode == "cross_lingual":
-            if not prompt_audio:
-                raise HTTPException(400, "cross_lingual mode requires prompt_wav or voice (custom voice ID)")
-        elif mode == "instruct":
-            if not prompt_audio:
-                raise HTTPException(400, "instruct mode requires prompt_wav or voice (custom voice ID)")
-            if not instruct_text:
-                raise HTTPException(400, "instruct mode requires instruct_text")
-        elif mode == "sft":
-            if not spk_id:
-                raise HTTPException(400, "sft mode requires spk_id (speaker ID)")
-        
-        if mode == "sft":
-            output = model.inference_sft(text, spk_id, stream=stream, speed=speed)
-        elif mode == "zero_shot":
-            output = model.inference_zero_shot(text, prompt_text, prompt_audio, stream=stream, speed=speed)
-        elif mode == "cross_lingual":
-            output = model.inference_cross_lingual(text, prompt_audio, stream=stream, speed=speed)
-        elif mode == "instruct":
-            if hasattr(model, 'inference_instruct2'):
-                output = model.inference_instruct2(text, instruct_text, prompt_audio, stream=stream, speed=speed)
+        model, gpu_id = gpu_manager.get_model_for_request()
+        prompt_audio = None
+        is_temp_file = False
+
+        # 优先使用自定义音色
+        custom_voice = voice_manager.get(voice) if voice else None
+        if custom_voice:
+            prompt_audio = custom_voice["audio_path"]
+            prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
+        elif prompt_wav:
+            content = await prompt_wav.read()
+            temp_path = INPUT_DIR / f"prompt_{uuid.uuid4().hex}.wav"
+            temp_path.write_bytes(content)
+            prompt_audio = str(temp_path)
+            is_temp_file = True
+
+        try:
+            # 参数验证
+            if mode == "zero_shot":
+                if not prompt_audio:
+                    raise HTTPException(400, "zero_shot mode requires prompt_wav or voice (custom voice ID)")
+                if not prompt_text and not custom_voice:
+                    print("Auto transcribing prompt audio with Fun-ASR...")
+                    prompt_text = transcribe_audio(prompt_audio)
+                    prompt_text = f'<|endofprompt|>{prompt_text}'
+                    print(f"Transcribed: {prompt_text}")
+            elif mode == "cross_lingual":
+                if not prompt_audio:
+                    raise HTTPException(400, "cross_lingual mode requires prompt_wav or voice (custom voice ID)")
+            elif mode == "instruct":
+                if not prompt_audio:
+                    raise HTTPException(400, "instruct mode requires prompt_wav or voice (custom voice ID)")
+                if not instruct_text:
+                    raise HTTPException(400, "instruct mode requires instruct_text")
+            elif mode == "sft":
+                if not spk_id:
+                    raise HTTPException(400, "sft mode requires spk_id (speaker ID)")
+
+            if mode == "sft":
+                output = model.inference_sft(text, spk_id, stream=stream, speed=speed)
+            elif mode == "zero_shot":
+                output = model.inference_zero_shot(text, prompt_text, prompt_audio, stream=stream, speed=speed)
+            elif mode == "cross_lingual":
+                output = model.inference_cross_lingual(text, prompt_audio, stream=stream, speed=speed)
+            elif mode == "instruct":
+                if hasattr(model, 'inference_instruct2'):
+                    output = model.inference_instruct2(text, instruct_text, prompt_audio, stream=stream, speed=speed)
+                else:
+                    output = model.inference_instruct(text, spk_id, instruct_text, stream=stream, speed=speed)
             else:
-                output = model.inference_instruct(text, spk_id, instruct_text, stream=stream, speed=speed)
-        else:
-            raise HTTPException(400, f"Unknown mode: {mode}")
-        
-        if stream:
-            return StreamingResponse(
-                generate_audio_stream(output, model.sample_rate, cleanup_path=prompt_audio if is_temp_file else None),
-                media_type="audio/pcm"
-            )
-        
-        # Collect all chunks
-        speeches = []
-        for chunk in output:
-            speeches.append(chunk['tts_speech'])
-        
-        full_speech = torch.cat(speeches, dim=1)
-        filename = f"tts_{uuid.uuid4().hex}.wav"
-        output_path = save_audio(full_speech, model.sample_rate, filename)
-        
-        # Cleanup temp file for non-streaming mode (only if it's a temp file)
-        if is_temp_file and prompt_audio and Path(prompt_audio).exists():
-            Path(prompt_audio).unlink()
-        
-        return FileResponse(output_path, media_type="audio/wav", filename=filename)
-    
-    except Exception as e:
-        # Cleanup on error (only if it's a temp file)
-        if is_temp_file and prompt_audio and Path(prompt_audio).exists():
-            Path(prompt_audio).unlink()
-        raise
+                raise HTTPException(400, f"Unknown mode: {mode}")
+
+            if stream:
+                return StreamingResponse(
+                    generate_stream_with_semaphore(output, model.sample_rate, cleanup_path=prompt_audio if is_temp_file else None),
+                    media_type="audio/pcm",
+                )
+
+            # Collect all chunks
+            speeches = []
+            for chunk in output:
+                speeches.append(chunk['tts_speech'])
+
+            full_speech = torch.cat(speeches, dim=1)
+            filename = f"tts_{uuid.uuid4().hex}.wav"
+            output_path = save_audio(full_speech, model.sample_rate, filename)
+
+            # Cleanup temp file for non-streaming mode
+            if is_temp_file and prompt_audio and Path(prompt_audio).exists():
+                Path(prompt_audio).unlink()
+
+            return FileResponse(output_path, media_type="audio/wav", filename=filename)
+
+        except Exception as e:
+            # Cleanup on error
+            if is_temp_file and prompt_audio and Path(prompt_audio).exists():
+                Path(prompt_audio).unlink()
+            raise
+    finally:
+        gpu_manager.semaphore.release()
 
 @app.post("/api/tts/async")
 async def tts_async(
