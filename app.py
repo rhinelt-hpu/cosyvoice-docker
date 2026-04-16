@@ -137,10 +137,10 @@ class GPUManager:
     def _load_model(self, model_dir: str):
         if self.model is not None:
             self.offload()
-        print(f"Loading model from {model_dir}...")
-        self.model = AutoModel(model_dir=model_dir)
+        print(f"Loading model from {model_dir} with FP16 acceleration...")
+        self.model = AutoModel(model_dir=model_dir, fp16=True)
         self.model_dir = model_dir
-        print(f"Model loaded successfully!")
+        print(f"Model loaded successfully (FP16)!")
     
     def preload(self):
         """启动时预热模型和所有音色的 embedding"""
