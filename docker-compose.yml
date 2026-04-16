@@ -14,8 +14,8 @@ services:
       - PORT=8188
       - NUM_GPUS=${NUM_GPUS:-1}
       - MAX_CONCURRENT=${MAX_CONCURRENT:-4}
-      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}
       - GPU_IDLE_TIMEOUT=${GPU_IDLE_TIMEOUT:-600}
+      - NVIDIA_VISIBLE_DEVICES=all
     deploy:
       resources:
         reservations:

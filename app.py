@@ -28,11 +28,6 @@ sys.path.insert(0, str(ROOT_DIR / "third_party/Matcha-TTS"))
 from cosyvoice.cli.cosyvoice import AutoModel
 from cosyvoice.utils.file_utils import load_wav
 
-# Register vLLM custom model for CosyVoice
-from vllm import ModelRegistry
-from cosyvoice.vllm.cosyvoice2 import CosyVoice2ForCausalLM
-ModelRegistry.register_model("CosyVoice2ForCausalLM", CosyVoice2ForCausalLM)
-
 # Fun-ASR-Nano for auto transcription
 _asr_model = None
 
@@ -145,13 +140,13 @@ class GPUManager:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            print(f"Loading model on GPU {gpu_id} from {model_dir} with FP16 + vLLM acceleration...")
-            model = AutoModel(model_dir=model_dir, fp16=True, load_vllm=True, load_trt=False)
+            print(f"Loading model on GPU {gpu_id} from {model_dir} with FP16 acceleration...")
+            model = AutoModel(model_dir=model_dir, fp16=True)
             self.model_dir = model_dir
             self.models.append(model)
             self.model_gpus.append(gpu_id)
             self.prompt_caches[gpu_id] = {}
-            print(f"Model loaded successfully on GPU {gpu_id} (FP16 + vLLM)!")
+            print(f"Model loaded successfully on GPU {gpu_id} (FP16)!")
         finally:
             if prev_cuda is not None:
                 os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
@@ -209,17 +204,12 @@ class GPUManager:
         idx = self.model_gpus.index(gpu_id)
         return self.models[idx], gpu_id
 
-    async def run_inference(self, func, *args, **kwargs):
-        """并发安全的推理入口（非流式）"""
+    async def run_inference(self, model_func):
+        """并发安全的推理入口（非流式），自动管理 semaphore"""
         async with self.semaphore:
-            model, gpu_id = self.get_model_for_request()
-            result = await asyncio.to_thread(func, model, gpu_id, *args, **kwargs)
+            model, _ = self.get_model_for_request()
+            result = await asyncio.to_thread(model_func, model)
             return result
-
-    def run_inference_sync(self, func, *args, **kwargs):
-        """并发安全的推理入口（同步，用于流式 StreamingResponse）"""
-        model, gpu_id = self.get_model_for_request()
-        return func(model, gpu_id, *args, **kwargs)
 
     def offload(self):
         """手动卸载所有模型"""
@@ -334,7 +324,7 @@ def save_audio(speech: torch.Tensor, sample_rate: int, filename: str) -> str:
     torchaudio.save(str(output_path), speech, sample_rate)
     return str(output_path)
 
-def generate_audio_stream(model_output, sample_rate: int, cleanup_path: str = None):
+def generate_audio_stream(model_output, cleanup_path: str = None):
     """Generate PCM audio stream with fade-in and DC offset removal"""
     is_first_chunk = True
     dc_offset = 0.0
@@ -364,14 +354,6 @@ def generate_audio_stream(model_output, sample_rate: int, cleanup_path: str = No
         if cleanup_path and Path(cleanup_path).exists():
             Path(cleanup_path).unlink()
 
-
-def generate_stream_with_semaphore(model_output, sample_rate: int, cleanup_path: str = None):
-    """Stream generator that releases semaphore when done"""
-    try:
-        yield from generate_audio_stream(model_output, sample_rate, cleanup_path)
-    finally:
-        gpu_manager.semaphore.release()
-
 # ============== OpenAI-Compatible API ==============
 
 class SpeechRequest(BaseModel):
@@ -386,8 +368,7 @@ class SpeechRequest(BaseModel):
 async def openai_speech(request: SpeechRequest):
     """OpenAI-compatible TTS API (concurrency-controlled)"""
 
-    def _do_speech(model, gpu_id):
-        # 检查是否是自定义音色
+    def _do_speech(model):
         custom_voice = voice_manager.get(request.voice)
 
         if custom_voice:
@@ -434,7 +415,7 @@ async def openai_speech(request: SpeechRequest):
 
     if is_stream:
         return StreamingResponse(
-            generate_audio_stream(output_path, sample_rate),
+            generate_audio_stream(output_path),
             media_type="audio/pcm",
             headers={"X-Sample-Rate": str(sample_rate)}
         )
@@ -543,89 +524,89 @@ async def tts(
     stream: bool = Form(False),
     prompt_wav: Optional[UploadFile] = File(None)
 ):
-    # Acquire concurrency slot
-    await gpu_manager.semaphore.acquire()
-    try:
-        model, gpu_id = gpu_manager.get_model_for_request()
-        prompt_audio = None
-        is_temp_file = False
+    # 先准备推理参数（在 semaphore 之外，不占并发槽位）
+    prompt_audio = None
+    is_temp_file = False
 
-        # 优先使用自定义音色
-        custom_voice = voice_manager.get(voice) if voice else None
-        if custom_voice:
-            prompt_audio = custom_voice["audio_path"]
-            prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
-        elif prompt_wav:
-            content = await prompt_wav.read()
-            temp_path = INPUT_DIR / f"prompt_{uuid.uuid4().hex}.wav"
-            temp_path.write_bytes(content)
-            prompt_audio = str(temp_path)
-            is_temp_file = True
+    custom_voice = voice_manager.get(voice) if voice else None
+    if custom_voice:
+        prompt_audio = custom_voice["audio_path"]
+        prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
+    elif prompt_wav:
+        content = await prompt_wav.read()
+        temp_path = INPUT_DIR / f"prompt_{uuid.uuid4().hex}.wav"
+        temp_path.write_bytes(content)
+        prompt_audio = str(temp_path)
+        is_temp_file = True
 
-        try:
-            # 参数验证
-            if mode == "zero_shot":
-                if not prompt_audio:
-                    raise HTTPException(400, "zero_shot mode requires prompt_wav or voice (custom voice ID)")
-                if not prompt_text and not custom_voice:
-                    print("Auto transcribing prompt audio with Fun-ASR...")
-                    prompt_text = transcribe_audio(prompt_audio)
-                    prompt_text = f'<|endofprompt|>{prompt_text}'
-                    print(f"Transcribed: {prompt_text}")
-            elif mode == "cross_lingual":
-                if not prompt_audio:
-                    raise HTTPException(400, "cross_lingual mode requires prompt_wav or voice (custom voice ID)")
-            elif mode == "instruct":
-                if not prompt_audio:
-                    raise HTTPException(400, "instruct mode requires prompt_wav or voice (custom voice ID)")
-                if not instruct_text:
-                    raise HTTPException(400, "instruct mode requires instruct_text")
-            elif mode == "sft":
-                if not spk_id:
-                    raise HTTPException(400, "sft mode requires spk_id (speaker ID)")
+    # 参数验证
+    if mode == "zero_shot":
+        if not prompt_audio:
+            raise HTTPException(400, "zero_shot mode requires prompt_wav or voice (custom voice ID)")
+        if not prompt_text and not custom_voice:
+            print("Auto transcribing prompt audio with Fun-ASR...")
+            prompt_text = transcribe_audio(prompt_audio)
+            prompt_text = f'<|endofprompt|>{prompt_text}'
+            print(f"Transcribed: {prompt_text}")
+    elif mode == "cross_lingual":
+        if not prompt_audio:
+            raise HTTPException(400, "cross_lingual mode requires prompt_wav or voice (custom voice ID)")
+    elif mode == "instruct":
+        if not prompt_audio:
+            raise HTTPException(400, "instruct mode requires prompt_wav or voice (custom voice ID)")
+        if not instruct_text:
+            raise HTTPException(400, "instruct mode requires instruct_text")
+    elif mode == "sft":
+        if not spk_id:
+            raise HTTPException(400, "sft mode requires spk_id (speaker ID)")
 
-            if mode == "sft":
-                output = model.inference_sft(text, spk_id, stream=stream, speed=speed)
-            elif mode == "zero_shot":
-                output = model.inference_zero_shot(text, prompt_text, prompt_audio, stream=stream, speed=speed)
-            elif mode == "cross_lingual":
-                output = model.inference_cross_lingual(text, prompt_audio, stream=stream, speed=speed)
-            elif mode == "instruct":
-                if hasattr(model, 'inference_instruct2'):
-                    output = model.inference_instruct2(text, instruct_text, prompt_audio, stream=stream, speed=speed)
-                else:
-                    output = model.inference_instruct(text, spk_id, instruct_text, stream=stream, speed=speed)
+    def _do_inference(model):
+        """执行推理（在 semaphore 保护的线程中运行）"""
+        if mode == "sft":
+            return model.inference_sft(text, spk_id, stream=stream, speed=speed)
+        elif mode == "zero_shot":
+            return model.inference_zero_shot(text, prompt_text, prompt_audio, stream=stream, speed=speed)
+        elif mode == "cross_lingual":
+            return model.inference_cross_lingual(text, prompt_audio, stream=stream, speed=speed)
+        elif mode == "instruct":
+            if hasattr(model, 'inference_instruct2'):
+                return model.inference_instruct2(text, instruct_text, prompt_audio, stream=stream, speed=speed)
             else:
-                raise HTTPException(400, f"Unknown mode: {mode}")
+                return model.inference_instruct(text, spk_id, instruct_text, stream=stream, speed=speed)
+        else:
+            raise HTTPException(400, f"Unknown mode: {mode}")
 
-            if stream:
-                return StreamingResponse(
-                    generate_stream_with_semaphore(output, model.sample_rate, cleanup_path=prompt_audio if is_temp_file else None),
-                    media_type="audio/pcm",
-                )
+    if stream:
+        # 流式：在 acquire 后启动推理，semaphore 在 generator 结束时 release
+        async def stream_generator():
+            await gpu_manager.semaphore.acquire()
+            try:
+                model, gpu_id = gpu_manager.get_model_for_request()
+                model_output = _do_inference(model)
+                try:
+                    for chunk in generate_audio_stream(model_output, cleanup_path=prompt_audio if is_temp_file else None):
+                        yield chunk
+                finally:
+                    if is_temp_file and prompt_audio and Path(prompt_audio).exists():
+                        Path(prompt_audio).unlink()
+            finally:
+                gpu_manager.semaphore.release()
 
-            # Collect all chunks
-            speeches = []
-            for chunk in output:
-                speeches.append(chunk['tts_speech'])
-
+        return StreamingResponse(stream_generator(), media_type="audio/pcm")
+    else:
+        # 非流式：用 run_inference 自动管理 semaphore
+        def _collect_audio(model):
+            output = _do_inference(model)
+            speeches = [chunk['tts_speech'] for chunk in output]
             full_speech = torch.cat(speeches, dim=1)
             filename = f"tts_{uuid.uuid4().hex}.wav"
             output_path = save_audio(full_speech, model.sample_rate, filename)
-
-            # Cleanup temp file for non-streaming mode
             if is_temp_file and prompt_audio and Path(prompt_audio).exists():
                 Path(prompt_audio).unlink()
+            return output_path
 
-            return FileResponse(output_path, media_type="audio/wav", filename=filename)
-
-        except Exception as e:
-            # Cleanup on error
-            if is_temp_file and prompt_audio and Path(prompt_audio).exists():
-                Path(prompt_audio).unlink()
-            raise
-    finally:
-        gpu_manager.semaphore.release()
+        output_path = await gpu_manager.run_inference(_collect_audio)
+        return FileResponse(output_path, media_type="audio/wav", filename=output_path)
 
 @app.post("/api/tts/async")
 async def tts_async(
